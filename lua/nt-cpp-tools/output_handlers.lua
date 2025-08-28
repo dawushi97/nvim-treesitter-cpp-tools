@@ -22,7 +22,13 @@ local function add_to_cpp(output, _)
     local file_name = vim.fn.expand('%:r')
     vim.api.nvim_command('vsp ' .. file_name ..
         '.' .. config.source_extension)
-    util.add_text_edit(output, 1, 0)
+    
+    -- Get total line count of current buffer, add at the end
+    local line_count = vim.api.nvim_buf_line_count(0)
+    
+    -- Add an empty line at the end, then add the generated code
+    local final_output = "\n" .. output
+    util.add_text_edit(final_output, line_count, 0)
 end
 
 function M.get_add_to_cpp(_)

@@ -69,7 +69,12 @@ local function get_lines(bufnr, rows)
 end
 
 local function get_line(bufnr, row)
-  return get_lines(bufnr, { row })[row]
+  local line = get_lines(bufnr, { row })[row]
+  if line == nil then
+    -- Return empty string instead of nil if line doesn't exist
+    return ""
+  end
+  return line
 end
 
 local function get_line_byte_from_position(bufnr, position, offset_encoding)

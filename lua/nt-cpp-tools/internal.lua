@@ -1,6 +1,3 @@
-local ts_utils = require("nvim-treesitter.ts_utils")
-local ts_query = require("nvim-treesitter.query")
-local parsers = require("nvim-treesitter.parsers")
 local previewer = require("nt-cpp-tools.preview_printer")
 local output_handlers = require("nt-cpp-tools.output_handlers")
 local util = require("nt-cpp-tools.util")
@@ -25,9 +22,9 @@ end
 
 local function run_on_nodes(query, runner, sel_start_row, sel_end_row)
     local bufnr = 0
-    local ft = vim.api.nvim_buf_get_option(bufnr, 'ft')
+    local ft = vim.bo[bufnr].filetype
 
-    local parser = parsers.get_parser(bufnr, ft)
+    local parser = vim.treesitter.get_parser(bufnr, ft)
     local root = parser:parse()[1]:root()
 
     local matches = query:iter_matches(root, bufnr, sel_start_row, sel_end_row + 1)
@@ -219,7 +216,6 @@ local function find_class_details(member_node, member_data)
     if member_node:parent():type() == 'template_declaration'  then
       member_node = member_node:parent()
     end
-    -- print(member_node:parent():type())
 
     -- If global function, member node is the highest, no class data available
     -- but function requires the scope end row to return
@@ -264,12 +260,18 @@ function M.imp_func(range_start, range_end, custom_cb)
     range_start = range_start - 1
     range_end = range_end - 1
 
-    local query = ts_query.get_query('cpp', 'outside_class_def')
+    local query = vim.treesitter.query.get('cpp', 'outside_class_def')
 
     local e_row
     local results = {}
     local runner =  function(captures, match)
-        for cid, node in pairs(match) do
+        for cid, node_or_table in pairs(match) do
+            -- Handle new API: match may contain node tables
+            local node = node_or_table
+            if type(node_or_table) == 'table' and node_or_table[1] then
+                node = node_or_table[1]
+            end
+            
             local cap_str = captures[cid]
             if cap_str == 'member_function' then
                 local fun_start, _, fun_end, _ = node:range()
@@ -342,52 +344,125 @@ function M.concrete_class_imp(range_start, range_end)
     range_start = range_start - 1
     range_end = range_end - 1
 
-    local query = ts_query.get_query('cpp', 'concrete_implement')
-    local base_class = ''
-    local results = {}
-    local e_row
-    local runner =  function(captures, matches)
-        for p, node in pairs(matches) do
-            local cap_str = captures[p]
-            local value = ''
-            for id, line in pairs(get_node_text(node)) do
-                value = (id == 1 and line or value .. '\n' .. line)
+    -- Get selected text directly from buffer
+    local bufnr = vim.api.nvim_get_current_buf()
+    local lines = vim.api.nvim_buf_get_lines(bufnr, range_start, range_end + 1, false)
+    local selected_text = table.concat(lines, '\n')
+    
+    -- Extract class name using simple pattern matching
+    local base_class = selected_text:match('class%s+([%w_]+)')
+    if not base_class then
+        vim.notify('Error: Could not find class name in selection', vim.log.levels.ERROR)
+        return
+    end
+    
+    -- Find pure virtual functions using pattern matching
+    local virtual_functions = {}
+    
+    -- Pattern to match virtual functions ending with = 0
+    for line in selected_text:gmatch('[^\r\n]+') do
+        local trimmed = line:match('^%s*(.-)%s*$') -- trim whitespace
+        if trimmed:match('virtual.*=.*0') then
+            -- Clean up the function declaration
+            local cleaned = trimmed
+                :gsub('^%s*virtual%s+', '')  -- Remove 'virtual' keyword
+                :gsub('%s*=%s*0%s*;?%s*$', ' override;')  -- Replace '= 0' with 'override;'
+                
+            -- Ensure proper semicolon
+            if not cleaned:match(';%s*$') then
+                cleaned = cleaned .. ';'
             end
-
-            if cap_str == 'base_class_name' then
-                base_class = value
-            elseif cap_str == 'class' then
-                _, _, e_row, _ = node:range()
-            elseif cap_str == 'virtual' then
-                results[#results+1] = value:gsub('^virtual', ''):gsub([[= *0]], 'override')
-            end
+            
+            table.insert(virtual_functions, cleaned)
         end
     end
-
-    if not run_on_nodes(query, runner, range_start, range_end) then
+    
+    if #virtual_functions == 0 then
+        vim.notify('No pure virtual functions found in selection', vim.log.levels.WARN)
         return
     end
-
-    if #results == 0 then
-        vim.notify('No virtual functions detected to implement')
+    
+    -- Ask user for new class name
+    local class_name = vim.fn.input("New concrete class name: ", base_class .. "Impl")
+    if class_name == "" then
+        vim.notify('Operation cancelled', vim.log.levels.INFO)
         return
     end
-
-    local class_name = vim.fn.input("New Name: ", base_class .. "Impl")
-    local class = string.format('class %s : public %s\n{\npublic:\n', class_name, base_class)
-    for _, imp in ipairs(results) do
-        class = class .. imp .. '\n'
+    
+    -- Generate concrete class
+    local class_lines = {}
+    table.insert(class_lines, string.format('class %s : public %s', class_name, base_class))
+    table.insert(class_lines, '{')
+    table.insert(class_lines, 'public:')
+    
+    for _, func in ipairs(virtual_functions) do
+        table.insert(class_lines, '    ' .. func)
     end
-    class = class .. '};'
-
-    output_handlers.get_preview_and_apply()(class, {class_end_row = e_row})
+    
+    table.insert(class_lines, '};')
+    
+    local class_text = table.concat(class_lines, '\n')
+    
+    -- Use the preview and apply system
+    output_handlers.get_preview_and_apply()(class_text, {class_end_row = range_end})
 end
 
 function M.rule_of_5(limit_at_3, range_start, range_end)
-    range_start = range_start - 1
-    range_end = range_end - 1
-
-    local query = ts_query.get_query('cpp', 'special_function_detectors')
+    
+    -- If range is invalid (user didn't select text), try auto-detection
+    if range_start == range_end then
+        -- Get current cursor position
+        local cursor_line = vim.api.nvim_win_get_cursor(0)[1] - 1  -- Convert to 0-indexed
+        
+        -- Try to find the class definition range at cursor
+        local bufnr = vim.api.nvim_get_current_buf()
+        local parser = vim.treesitter.get_parser(bufnr, 'cpp')
+        local tree = parser:parse()[1]
+        local root = tree:root()
+        
+        -- Find class definition containing cursor position
+        local function find_class_at_cursor(node, cursor_row)
+            if node:type() == "class_specifier" then
+                local start_row, _, end_row, _ = node:range()
+                if start_row <= cursor_row and cursor_row <= end_row then
+                    return start_row, end_row
+                end
+            end
+            
+            for child in node:iter_children() do
+                local class_start, class_end = find_class_at_cursor(child, cursor_row)
+                if class_start then
+                    return class_start, class_end
+                end
+            end
+            return nil
+        end
+        
+        local class_start, class_end = find_class_at_cursor(root, cursor_line)
+        if class_start then
+            range_start = class_start
+            range_end = class_end
+        else
+            vim.notify("Error: Unable to find class definition at cursor", vim.log.levels.ERROR)
+            return
+        end
+    else
+        range_start = range_start - 1
+        range_end = range_end - 1
+    end
+    
+    -- Get current buffer filetype, supporting various C++ header filetypes
+    local bufnr = vim.api.nvim_get_current_buf()
+    local ft = vim.bo[bufnr].filetype
+    
+    -- Map various C++ related filetypes to cpp
+    local cpp_filetypes = { cpp = 'cpp', c = 'cpp', hpp = 'cpp', h = 'cpp' }
+    local query_ft = cpp_filetypes[ft] or ft
+    
+    -- First use general query to find class name
+    local class_query = vim.treesitter.query.get(query_ft, 'class_detectors')
+    local special_query = vim.treesitter.query.get(query_ft, 'special_function_detectors')
+    
 
     local checkers = {
         destructor = false,
@@ -407,68 +482,160 @@ function M.rule_of_5(limit_at_3, range_start, range_end)
     end
 
     local runner = function(captures, matches)
-        for p, node in pairs(matches) do
-            local cap_str = captures[p]
-            local value = ''
-            for id, line in pairs(get_node_text(node)) do
-                value = (id == 1 and line or value .. '\n' .. line)
+        
+        for capture_id, node_list in pairs(matches) do
+            local cap_str = captures[capture_id]
+            
+            -- In Neovim 0.11, matches now returns node arrays instead of single nodes
+            -- We need to iterate through each captured node
+            local nodes_to_process = {}
+            if type(node_list) == 'table' and not node_list.type then
+                -- This is a node array
+                nodes_to_process = node_list
+            else
+                -- This is a single node (backward compatibility)
+                nodes_to_process = {node_list}
             end
-            local start_row, start_col, _, _ = node:range()
-
-            if cap_str == "class_name" then
-                class_name = value
-            elseif cap_str ==  "destructor" then
-                checkers.destructor = true
-                entry_location_update(start_row, start_col)
-            elseif cap_str ==  "assignment_operator_reference_declarator" then
-                checkers.copy_assignment = true
-                entry_location_update(start_row, start_col)
-            elseif cap_str ==  "copy_construct_function_declarator" then
-                checkers.copy_constructor = true
-                entry_location_update(start_row, start_col)
-            elseif not limit_at_3 then
-                if cap_str == "move_assignment_operator_reference_declarator" then
-                    checkers.move_assignment = true
-                    entry_location_update(start_row, start_col)
-                elseif cap_str == "move_construct_function_declarator" then
-                    checkers.move_constructor = true
-                    entry_location_update(start_row, start_col)
+            
+            for _, node in ipairs(nodes_to_process) do
+                -- Add nil check
+                if not node then
+                    goto continue_node
                 end
+                
+                
+                local value = vim.treesitter.get_node_text(node, 0) or ''
+                local start_row, start_col, _, _ = node:range()
+
+                -- Determine capture type based on node type, as old API index mapping is unreliable
+                local node_type = node:type()
+                
+                if node_type == "type_identifier" then
+                    -- This should be the class name
+                    class_name = value
+                elseif node_type == "destructor_name" then
+                    -- Destructor
+                    checkers.destructor = true
+                    entry_location_update(start_row, start_col)
+                elseif node_type == "reference_declarator" then
+                    -- This might be assignment operator or constructor
+                    -- Need to further check parent node or content
+                    if value:find("operator=") then
+                        if value:find("&&") then
+                            if not limit_at_3 then
+                                checkers.move_assignment = true
+                                entry_location_update(start_row, start_col)
+                            end
+                        else
+                            checkers.copy_assignment = true
+                            entry_location_update(start_row, start_col)
+                        end
+                    end
+                elseif node_type == "function_declarator" then
+                    -- This might be a constructor
+                    if value:find("&&") then
+                        if not limit_at_3 then
+                            checkers.move_constructor = true
+                            entry_location_update(start_row, start_col)
+                        end
+                    else
+                        checkers.copy_constructor = true
+                        entry_location_update(start_row, start_col)
+                    end
+                elseif node_type == "class_specifier" then
+                    -- This is the entire class definition, no processing needed
+                    -- (class name already obtained from type_identifier)
+                end
+                ::continue_node::
             end
         end
     end
 
-    if not run_on_nodes(query, runner, range_start, range_end) then
+    -- Stage 1: Use general query to get class name
+    local class_runner = function(captures, matches)
+        for capture_id, node_list in pairs(matches) do
+            local cap_str = captures[capture_id]
+            local nodes_to_process = type(node_list) == 'table' and not node_list.type and node_list or {node_list}
+            
+            for _, node in ipairs(nodes_to_process) do
+                if not node then goto continue_node end
+                
+                local node_type = node:type()
+                if node_type == "type_identifier" and cap_str == "class_name" then
+                    class_name = vim.treesitter.get_node_text(node, 0) or ''
+                end
+                ::continue_node::
+            end
+        end
+    end
+    
+    -- First try to get class name
+    if not run_on_nodes(class_query, class_runner, range_start, range_end) then
         return
     end
+    
+    -- Stage 2: Detect special member functions
+    local special_result = run_on_nodes(special_query, runner, range_start, range_end)
+    
+    if not special_result then
+        -- If special function query fails but we have class name, continue processing
+        if not class_name then
+            return
+        end
+    end
+    
+    -- If no special functions were found, set a default entry location
+    -- This typically happens when the class has no special member functions at all
+    if not entry_location then
+        -- Default to the line before the closing brace
+        -- range_end is 0-indexed, we want to insert before the closing brace
+        local buf_line_count = vim.api.nvim_buf_line_count(0)
+        local insert_row = math.min(range_end - 1, buf_line_count - 1)
+        entry_location = { start_row = insert_row, start_col = 0 }
+    end
 
+    -- Check if class name was successfully obtained
+    if not class_name then
+        vim.notify("Error: Unable to find class name. Please ensure cursor is within a class definition.", vim.log.levels.ERROR)
+        return
+    end
+    
+
+    -- Rule of 3: Only supplement when partially implemented
+    -- Skip conditions: fully implemented or not implemented at all
     local skip_rule_of_3 = (checkers.copy_assignment and checkers.copy_constructor and checkers.destructor) or
                             (not checkers.copy_assignment and not checkers.copy_constructor and not checkers.destructor)
 
-    local skip_rule_of_5 =  ( ( checkers.copy_assignment and checkers.copy_constructor and checkers.destructor and
-                                    checkers.move_assignment and checkers.move_constructor ) or
-                                (not checkers.copy_assignment and not checkers.copy_constructor and not checkers.destructor and
-                                    not checkers.move_assignment and not checkers.move_constructor) )
+    -- Rule of 5: Only supplement when partially implemented  
+    -- Skip conditions: fully implemented or not implemented at all
+    local skip_rule_of_5 = (checkers.copy_assignment and checkers.copy_constructor and checkers.destructor and
+                                checkers.move_assignment and checkers.move_constructor) or
+                            (not checkers.copy_assignment and not checkers.copy_constructor and not checkers.destructor and
+                                not checkers.move_assignment and not checkers.move_constructor)
 
     if limit_at_3 and skip_rule_of_3 then
-        local notifyMsg = [[ No change needed since either non or all of the following is implemented
-            - destructor
-            - copy constructor
-            - assignment constructor
-            ]]
-        vim.notify(notifyMsg)
+        local all_implemented = checkers.copy_assignment and checkers.copy_constructor and checkers.destructor
+        local none_implemented = not checkers.copy_assignment and not checkers.copy_constructor and not checkers.destructor
+        
+        if all_implemented then
+            vim.notify("Rule of 3: All functions already implemented", vim.log.levels.INFO)
+        elseif none_implemented then
+            vim.notify("Rule of 3: No special functions detected, default behavior sufficient", vim.log.levels.INFO)
+        end
         return
     end
 
     if not limit_at_3 and skip_rule_of_5 then
-        local notifyMsg = [[ No change needed since either non or all of the following is implemented
-            - destructor
-            - copy constructor
-            - assignment constructor
-            - move costructor
-            - move assignment
-            ]]
-        vim.notify(notifyMsg)
+        local all_implemented = checkers.copy_assignment and checkers.copy_constructor and checkers.destructor and
+                                checkers.move_assignment and checkers.move_constructor
+        local none_implemented = not checkers.copy_assignment and not checkers.copy_constructor and not checkers.destructor and
+                                 not checkers.move_assignment and not checkers.move_constructor
+        
+        if all_implemented then
+            vim.notify("Rule of 5: All functions already implemented", vim.log.levels.INFO)
+        elseif none_implemented then
+            vim.notify("Rule of 5: No special functions detected, default behavior sufficient", vim.log.levels.INFO)
+        end
         return
     end
 
@@ -510,18 +677,16 @@ function M.rule_of_5(limit_at_3, range_start, range_end)
 
         if not checkers.move_constructor then
             util.add_text_edit(newLine, entry_location.start_row, 0)
-            local txt = class_name .. '(const ' .. class_name .. '&&) noexcept;'
+            local txt = class_name .. '(' .. class_name .. '&&) noexcept;'
             add_txt_below_existing_def(txt)
         end
     end
 end
 
 function M.attach(bufnr, lang)
-    print("attach")
 end
 
 function M.detach(bufnr)
-    print("dattach")
 end
 
 M.commands = {

@@ -3,6 +3,8 @@
 
 Experimental treesitter based neovim plugin to create intelligent implementations for C++
 
+> **📢 Important Update (2025)**: This plugin is now fully compatible with Neovim's native TreeSitter API! The nvim-treesitter plugin is no longer required as a dependency. All functionality is implemented using Neovim's built-in `vim.treesitter` API.
+
 ## Features
 
 1. Out-of class member function implementation
@@ -25,7 +27,8 @@ Using [packer.nvim](https://github.com/wbthomason/packer.nvim)
 
 ```lua
 use {
-    requires = { "nvim-treesitter/nvim-treesitter" },
+    -- No longer requires nvim-treesitter as dependency, uses Neovim's native treesitter API
+    -- requires = { "nvim-treesitter/nvim-treesitter" },
     "Badhi/nvim-treesitter-cpp-tools",
 }
 ```
@@ -34,7 +37,8 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim)
 ```lua
 {
     "Badhi/nvim-treesitter-cpp-tools",
-    dependencies = { "nvim-treesitter/nvim-treesitter" },
+    -- No longer requires nvim-treesitter as dependency, uses Neovim's native treesitter API
+    -- dependencies = { "nvim-treesitter/nvim-treesitter" },
     -- Optional: Configuration
     opts = function()
         local options = {
